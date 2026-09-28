@@ -62,6 +62,47 @@ Stop the host with Ctrl-C in Terminal 2.
 
 ---
 
+## C) Drive it against a goose-gateway (no pairing, no relay)
+
+Needs the `goose-gateway` binary (`gateway`) and a `goose` for its southbound
+side. This path never loads the iroh wasm.
+
+```bash
+# terminal 1 — gateway (static auth = tenant headers on initialize)
+gateway -listen :13300 -auth static -tenants t1=/var/lib/goose/t1
+
+# terminal 2 — the app; same-origin /acp is proxied to the gateway
+cd mobile-web/webapp
+GOOSE_GATEWAY=http://127.0.0.1:13300 pnpm dev
+```
+
+Open <http://localhost:5178?gateway=1> (the query forces the gateway branch and
+skips the wasm download). Pick **gateway**, leave the URL blank, fill
+`tenant id`, hit **connect** → **+ New session** → chat. `session/list` comes
+from the gateway itself, so you only see this tenant's sessions.
+
+With `-auth jwt`, switch the auth mode and paste the bearer token instead — it
+is sent on every request.
+
+Production = same thing behind a same-origin reverse proxy: the gateway serves
+no CORS, so a cross-origin URL will fail by design (the UI says so). Keep
+response buffering off for `/acp` (nginx: `proxy_buffering off;`) or the SSE
+stream sits in the proxy's buffer.
+
+Automated equivalent of everything above, no gateway binary needed:
+
+```bash
+node tests/gateway-smoke.mjs     # mocks the transport, drives the real UI twice
+node tests/gateway-live.mjs      # same assertions against a running gateway
+#   GOOSE_GATEWAY_URL=http://192.168.3.19:7731 TENANT=t1 USER_ID=u1 \
+#     node tests/gateway-live.mjs
+node tests/dist-proxy.mjs        # built dist/ behind a streaming reverse proxy
+#   GOOSE_GATEWAY_URL=http://192.168.3.19:7731 TENANT=t1 USER_ID=u1 \
+#     node tests/dist-proxy.mjs
+```
+
+---
+
 ### Notes / gotchas
 - **Order matters**: accept the browser key *before* (or during) `roam share` —
   the live share re-reads the allowlist per connection, so accepting after it's

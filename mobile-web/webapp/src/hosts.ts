@@ -2,22 +2,34 @@
 // shapes for saved hosts and live connections.
 import type { GooseClient } from "@aaif/goose-sdk";
 import type { RoamConnection } from "./wasm/goose_roaming_web.js";
+import type { GatewayAuth } from "./gateway.js";
 
 export const HOST_CARD_KEY = "goose-roam-last-host-card";
 export const HOSTS_KEY = "goose-roam-hosts";
 
 // Kept most-recently-used-first by the connect path (unshift on reconnect).
-export type SavedHost = { name: string; card: string; endpointId: string };
+// `card` is the target exactly as the user entered it: a `goose+roam://` card
+// for a P2P host, a gateway base URL for a direct-gateway target.
+export type SavedHost = {
+  name: string;
+  card: string;
+  endpointId: string;
+  /** Present only for direct-gateway targets (how to authenticate to it). */
+  gateway?: GatewayAuth;
+};
 
-// One live roam connection. The tab holds several at once — each saved host
-// gets its own iroh duplex + GooseClient, and the session list is the merge.
+// One live connection — a roam duplex or a gateway HTTP stream. The tab holds
+// several at once — each saved target gets its own GooseClient, and the
+// session list is the merge.
 export type HostConn = {
   endpointId: string;
   name: string;
   agent: GooseClient;
   /** Held to keep the QUIC connection alive for the life of the entry. */
-  conn: RoamConnection;
+  conn: RoamConnection | null;
   relay: string | null;
+  /** Auth for direct-gateway targets, re-applied on every reconnect. */
+  gateway?: GatewayAuth;
 };
 
 export function relayRegion(cardText: string): string | null {

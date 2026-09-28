@@ -3,6 +3,50 @@ import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
 const ACP_CONNECTION_HEADER = "Acp-Connection-Id";
 const ACP_SESSION_HEADER = "Acp-Session-Id";
 
+/**
+ * Northbound auth for a direct `goose-gateway` target (`-auth static|jwt`).
+ * Keys are the stream's base URL ("" = same origin), so one browser tab can
+ * hold several gateways at once.
+ */
+export type AcpGatewayAuth = {
+  mode: "static" | "jwt";
+  tenantId?: string;
+  userId?: string;
+  token?: string;
+};
+
+const gatewayAuth = new Map<string, AcpGatewayAuth>();
+
+/** Register (or clear, with `null`) the auth headers for one gateway base. */
+export function registerAcpGatewayAuth(
+  baseUrl: string,
+  auth: AcpGatewayAuth | null,
+): void {
+  const key = baseUrl.replace(/\/+$/, "");
+  if (auth) gatewayAuth.set(key, auth);
+  else gatewayAuth.delete(key);
+}
+
+/**
+ * Headers for one request, per the gateway's two auth modes:
+ * `-auth static` puts the tenant/user headers on `initialize` only (the
+ * gateway binds identity to the connection id there and authenticates the
+ * connection afterwards), `-auth jwt` puts `Authorization: Bearer` on every
+ * request. Never logged.
+ */
+function authHeaders(base: string, phase: "initialize" | "request"): Record<string, string> {
+  const auth = gatewayAuth.get(base);
+  if (!auth) return {};
+  if (auth.mode === "jwt") {
+    return auth.token ? { Authorization: `Bearer ${auth.token}` } : {};
+  }
+  if (phase !== "initialize") return {};
+  const headers: Record<string, string> = {};
+  if (auth.tenantId) headers["X-Tenant-Id"] = auth.tenantId;
+  if (auth.userId) headers["X-User-Id"] = auth.userId;
+  return headers;
+}
+
 function acpDebug(label: string, payload: unknown): void {
   const g = globalThis as {
     ACP_DEBUG?: unknown;
@@ -73,8 +117,11 @@ function extractSessionId(value: unknown): string | null {
  * GET SSE stream plus a session-scoped stream per active `sessionId`.
  */
 export function createHttpStream(serverUrl: string): Stream {
+  // A relative base ("", same origin) resolves against the *document* path, so
+  // a build served under a path prefix (GitHub Pages project site) still hits
+  // its own reverse proxy; an absolute base is used verbatim.
   const base = serverUrl.replace(/\/+$/, "");
-  const endpoint = `${base}/acp`;
+  const endpoint = base ? `${base}/acp` : "acp";
 
   let connectionId: string | null = null;
   let connectionStreamAbort: AbortController | null = null;
@@ -85,7 +132,16 @@ export function createHttpStream(serverUrl: string): Stream {
   const inbox: AnyMessage[] = [];
   let pullResolve: (() => void) | null = null;
 
+  // A response can beat our own write: the gateway pushes the answer on the
+  // SSE stream while this POST is still awaiting its 202. The SDK only binds
+  // its handler to the pending request once the write settles, so an error
+  // delivered in that window (a -32001/-32601 answer) is reported to the page
+  // as an unhandled rejection. Hold each response until the write for that id
+  // has settled; successes are unaffected, errors stop being noisy.
+  const inflightWrites = new Map<number, Promise<void>>();
+
   function deliver(msg: AnyMessage) {
+    acpDebug("deliver → sdk", msg);
     inbox.push(msg);
     if (pullResolve) {
       const r = pullResolve;
@@ -110,6 +166,7 @@ export function createHttpStream(serverUrl: string): Stream {
       headers: {
         Accept: "text/event-stream",
         [ACP_CONNECTION_HEADER]: connectionId,
+        ...authHeaders(base, "request"),
       },
       signal: connectionStreamAbort.signal,
     });
@@ -143,6 +200,7 @@ export function createHttpStream(serverUrl: string): Stream {
           Accept: "text/event-stream",
           [ACP_CONNECTION_HEADER]: connectionId,
           [ACP_SESSION_HEADER]: sessionId,
+          ...authHeaders(base, "request"),
         },
         signal: abort.signal,
       });
@@ -226,6 +284,16 @@ export function createHttpStream(serverUrl: string): Stream {
 
   function handleInbound(msg: AnyMessage) {
     if (isResponse(msg)) {
+      const rid = (msg as { id?: unknown }).id;
+      const pending = typeof rid === "number" ? inflightWrites.get(rid) : undefined;
+      if (pending) {
+        acpDebug("hold response for write", { id: rid });
+        pending.then(
+          () => deliver(msg),
+          () => deliver(msg),
+        );
+        return;
+      }
       const sid = extractSessionId(messageResult(msg));
       if (sid && !openSessionStreams.has(sid)) {
         ensureSessionGetStream(sid).catch((err) => {
@@ -246,6 +314,7 @@ export function createHttpStream(serverUrl: string): Stream {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        ...authHeaders(base, "initialize"),
       },
       body: JSON.stringify(msg),
     });
@@ -281,6 +350,7 @@ export function createHttpStream(serverUrl: string): Stream {
       "Content-Type": "application/json",
       Accept: "application/json",
       [ACP_CONNECTION_HEADER]: connectionId,
+      ...authHeaders(base, "request"),
     };
 
     let outboundSessionId: string | null = null;
@@ -300,8 +370,18 @@ export function createHttpStream(serverUrl: string): Stream {
       try {
         await ensureSessionGetStream(outboundSessionId);
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error("Failed to ensure session GET stream:", err);
+        if (String(err).includes("409")) {
+          // 409 = another viewer already owns this session's stream (the
+          // gateway allows one subscriber per session). Our responses still
+          // arrive on the connection-scoped stream, so this is normal for a
+          // second device watching the same session — not an error.
+          acpDebug("session stream busy (409) — riding the connection stream", {
+            sessionId: outboundSessionId,
+          });
+        } else {
+          // eslint-disable-next-line no-console
+          console.error("Failed to ensure session GET stream:", err);
+        }
       }
     }
 
@@ -325,7 +405,10 @@ export function createHttpStream(serverUrl: string): Stream {
     try {
       await fetch(endpoint, {
         method: "DELETE",
-        headers: { [ACP_CONNECTION_HEADER]: connectionId },
+        headers: {
+          [ACP_CONNECTION_HEADER]: connectionId,
+          ...authHeaders(base, "request"),
+        },
       });
     } catch {
       // best-effort
@@ -366,20 +449,39 @@ export function createHttpStream(serverUrl: string): Stream {
 
   const writable = new WritableStream<AnyMessage>({
     async write(msg) {
-      if (
-        !connectionId &&
-        isRequest(msg) &&
-        messageMethod(msg) === "initialize"
-      ) {
-        await sendInitialize(msg);
-        return;
-      }
-      if (!connectionId) {
-        throw new Error(
-          "ACP transport: first outgoing message must be `initialize`",
+      const id = (msg as { id?: unknown }).id;
+      const tracked = isRequest(msg) && typeof id === "number";
+      let settle: () => void = () => {};
+      if (tracked) {
+        inflightWrites.set(
+          id,
+          new Promise<void>((r) => {
+            settle = r;
+          }),
         );
       }
-      await sendPost(msg);
+      try {
+        if (
+          !connectionId &&
+          isRequest(msg) &&
+          messageMethod(msg) === "initialize"
+        ) {
+          await sendInitialize(msg);
+          return;
+        }
+        if (!connectionId) {
+          throw new Error(
+            "ACP transport: first outgoing message must be `initialize`",
+          );
+        }
+        await sendPost(msg);
+      } finally {
+        if (tracked) {
+          acpDebug("write settled", { id });
+          settle();
+          inflightWrites.delete(id);
+        }
+      }
     },
     async close() {
       closed = true;

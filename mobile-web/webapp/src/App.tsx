@@ -9,13 +9,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ndJsonStream,
   PROTOCOL_VERSION,
+  RequestError,
   type Client,
   type SessionNotification,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type PlanEntry,
 } from "@agentclientprotocol/sdk";
-import { GooseClient } from "@aaif/goose-sdk";
+import { GooseClient, registerAcpGatewayAuth } from "@aaif/goose-sdk";
 import jsQR from "jsqr";
 import { Button } from "@desktop/components/ui/button";
 import { ChevronDown, ChevronLeft, ChevronRight, Menu, SlidersHorizontal, Square } from "lucide-react";
@@ -23,7 +24,7 @@ import { SessionMatrix } from "./SessionMatrix";
 import MarkdownContent from "@desktop/components/MarkdownContent";
 import { Goose } from "@desktop/components/icons/Goose";
 import { ToolCallStatusIndicator, type ToolCallStatus } from "@desktop/components/ToolCallStatusIndicator";
-import type { RoamClient } from "./wasm/goose_roaming_web.js";
+import type { RoamConnection } from "./wasm/goose_roaming_web.js";
 import { roamByteStreams } from "./roam-stream.js";
 import {
   HOST_CARD_KEY,
@@ -33,10 +34,24 @@ import {
   type SavedHost,
   type HostConn,
   loadHosts,
-  cardEndpointHint,
   relayRegion,
   loadCollapsed,
 } from "./hosts";
+import {
+  DEFAULT_GATEWAY_FORM,
+  connectErrorText,
+  errorText,
+  gatewayAuthFromForm,
+  gatewayBaseUrl,
+  gatewayEndpointId,
+  gatewayLabel,
+  isRoamCard,
+  normalizeGatewayUrl,
+  targetEndpointHint,
+  type GatewayAuth,
+  type GatewayForm,
+  type RoamLike,
+} from "./gateway";
 import { groupSessions, type TaggedSession } from "./sessions";
 import { ConnectPanel } from "./ConnectPanel";
 
@@ -115,7 +130,15 @@ function contentText(content: unknown): string {
 // renders and sets back with session/set_config_option. Keep the raw array
 // so the settings panel can render all of them, plus a helper to resolve
 // the current model's display name for the header badge.
-type ConfigSelectOption = { id: string; name: string; options?: ConfigSelectOption[] };
+// Select entries use ACP's `value` id (the live gateway sends {value,name},
+// never {id,name}) — keying/rendering by id here produced undefined keys and
+// made every <option> fall back to its label text.
+type ConfigSelectOption = {
+  value: string;
+  name: string;
+  description?: string | null;
+  options?: ConfigSelectOption[];
+};
 type ConfigOption = {
   type: string;
   id: string;
@@ -165,7 +188,7 @@ function modelFromConfigOptions(opts: ConfigOption[] | null | undefined): string
   const opt = opts?.find((o) => o.type === "select" && /model/i.test(o.id));
   if (!opt) return null;
   const current = typeof opt.currentValue === "string" ? opt.currentValue : null;
-  return flatSelectOptions(opt).find((x) => x.id === current)?.name ?? current;
+  return flatSelectOptions(opt).find((x) => x.value === current)?.name ?? current;
 }
 
 declare const __BUILD_STAMP__: string;
@@ -178,7 +201,18 @@ const REPLAY_TAIL = 200;
 
 let nextId = 1;
 
-export function App({ roam }: { roam: RoamClient }) {
+export function App({
+  roam: initialRoam,
+  loadRoam,
+}: {
+  roam: RoamLike;
+  /** Loads the iroh wasm transport on demand; null in gateway-only builds. */
+  loadRoam: (() => Promise<RoamLike>) | null;
+}) {
+  // Which transport is loaded: a gateway-only boot starts with a stub (no
+  // wasm, no iroh) and swaps in the real one the first time a roam card is
+  // used.
+  const [roam, setRoam] = useState<RoamLike>(initialRoam);
   const [items, setItems] = useState<Item[]>([]);
   const [status, setStatus] = useState("not connected");
   const [statusKind, setStatusKind] = useState<"idle" | "busy" | "ok" | "err">("idle");
@@ -246,6 +280,14 @@ export function App({ roam }: { roam: RoamClient }) {
   // the same consolidated workspace.
   const [showHosts, setShowHosts] = useState(false);
   const [hostName, setHostName] = useState("");
+  // Add-host form: which target kind, plus the gateway form's raw fields.
+  const [addMode, setAddMode] = useState<"roam" | "gateway">(
+    initialRoam.kind === "gateway" ? "gateway" : "roam",
+  );
+  const [gateway, setGatewayState] = useState<GatewayForm>(DEFAULT_GATEWAY_FORM);
+  const setGateway = useCallback((patch: Partial<GatewayForm>) => {
+    setGatewayState((g) => ({ ...g, ...patch }));
+  }, []);
   const resumeAfterDrop = useRef<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const scanStop = useRef<(() => void) | null>(null);
@@ -312,7 +354,7 @@ export function App({ roam }: { roam: RoamClient }) {
       void tick();
     } catch (err) {
       setScanning(false);
-      setStatus(`camera unavailable: ${err}`);
+      setStatus(`camera unavailable: ${errorText(err)}`);
       setStatusKind("err");
     }
   }, []);
@@ -354,6 +396,7 @@ export function App({ roam }: { roam: RoamClient }) {
       ).trim();
       window.history.replaceState(null, "", window.location.pathname + window.location.search);
       setCard(linked);
+      setAddMode("roam");
       setAddingHost(true);
       // Try connecting right away: if this browser is already paired we land
       // in sessions; if not, the host rejects us and the connect panel (with
@@ -363,14 +406,15 @@ export function App({ roam }: { roam: RoamClient }) {
     }
     const saved = localStorage.getItem(HOST_CARD_KEY);
     if (!saved) return;
-    setCard(saved);
+    if (!isRoamCard(saved)) setGateway({ url: saved });
+    else setCard(saved);
     // Known host: this is a resume, not a first visit — show "connecting"
     // instead of flashing the hosts page while the dial lands.
     setReconnecting(true);
     const last = localStorage.getItem(SESSION_KEY);
     if (last) {
       const [hostId, sessionId] = last.split("|");
-      if (hostId && sessionId && cardEndpointHint(saved) === hostId) {
+      if (hostId && sessionId && targetEndpointHint(saved) === hostId) {
         // connect() resumes this session once the dial lands (same path a
         // mid-conversation reconnect takes).
         resumeAfterDrop.current = sessionId;
@@ -520,6 +564,36 @@ export function App({ roam }: { roam: RoamClient }) {
         if (optionId) return { outcome: { outcome: "selected", optionId } };
         return { outcome: { outcome: "cancelled" } };
       },
+      // Reverse requests we have no surface for (elicitation, terminal, fs,
+      // whatever extension method a gateway asks on behalf of its southbound
+      // agent): answer -32601 right away so the ask resolves instead of
+      // sitting pending. Without these the SDK's optional-method fallback
+      // replies `result: null` for terminal/fs, which reads as a *successful*
+      // answer upstream — a rejection is the honest default.
+      async extMethod(method: string): Promise<Record<string, unknown>> {
+        throw RequestError.methodNotFound(method);
+      },
+      async writeTextFile() {
+        throw RequestError.methodNotFound("fs/write_text_file");
+      },
+      async readTextFile() {
+        throw RequestError.methodNotFound("fs/read_text_file");
+      },
+      async createTerminal() {
+        throw RequestError.methodNotFound("terminal/create");
+      },
+      async terminalOutput() {
+        throw RequestError.methodNotFound("terminal/output");
+      },
+      async waitForTerminalExit() {
+        throw RequestError.methodNotFound("terminal/wait_for_exit");
+      },
+      async releaseTerminal() {
+        throw RequestError.methodNotFound("terminal/release");
+      },
+      async killTerminal() {
+        throw RequestError.methodNotFound("terminal/kill");
+      },
     };
   }, [chunk, mutateItems]);
 
@@ -598,7 +672,13 @@ export function App({ roam }: { roam: RoamClient }) {
       setItems([{ kind: "system", id: nextId++, text: "New session — say hello" }]);
       void refreshSessions();
     } catch (err) {
-      push({ kind: "system", text: `could not start session: ${err}` } as Omit<Item, "id">);
+      const text = `could not start session: ${errorText(err)}`;
+      push({ kind: "system", text } as Omit<Item, "id">);
+      // The session-matrix front page renders no log pane, so a failed
+      // session/new would vanish there — mirror the mapped copy (§6: trace id
+      // included, never the raw JSON-RPC blob) onto the status line.
+      setStatus(text);
+      setStatusKind("err");
     } finally {
       setBusy(false);
     }
@@ -624,7 +704,11 @@ export function App({ roam }: { roam: RoamClient }) {
           setExternalActive(false);
           setExternalOverride(false);
         }
-        setConfigOptions([]);
+        // Don't wipe configOptions here: the 6s follow-mode poll re-loads the
+        // session after every turn, and until now the load response was never
+        // read — the settings gear (configOptions.length > 0) silently vanished
+        // after the first prompt. Refresh from the response below instead; if a
+        // server ever omits them, keep the previous set rather than blank the UI.
         setShowConfig(false);
         const info = sessions.find((x) => x._host === hostId && x.sessionId === id);
         document.title = info?.title ? `${info.title} · goose remote` : "goose remote";
@@ -656,10 +740,16 @@ export function App({ roam }: { roam: RoamClient }) {
         }
         setItems(buf);
         streamRole.current = null;
+        const opts = ((res as { configOptions?: unknown[] }).configOptions ?? []) as ConfigOption[];
+        if (opts.length > 0) {
+          setConfigOptions(opts);
+          const m = modelFromConfigOptions(opts);
+          if (m) setModelName(m);
+        }
         setStatus("connected");
         setStatusKind("ok");
       } catch (err) {
-        push({ kind: "system", text: `could not load session: ${err}` } as Omit<Item, "id">);
+        push({ kind: "system", text: `could not load session: ${errorText(err)}` } as Omit<Item, "id">);
         setStatus("connected");
         setStatusKind("ok");
       } finally {
@@ -712,117 +802,175 @@ export function App({ roam }: { roam: RoamClient }) {
   }, [connected, busy, openSession, refreshSessions]);
 
 
-  // Dial one host and add it to the live set. The tab holds a connection per
-  // saved host — the session list is the merge — so connecting a second host
+  // Dial one target and add it to the live set: a `goose+roam://` card (iroh
+  // duplex, relay) or a gateway base URL (ACP Streamable HTTP straight into
+  // goose-gateway — no pairing, no relay). The tab holds a connection per
+  // saved target — the session list is the merge — so connecting a second one
   // extends the workspace rather than replacing it.
   const reconnectAttempts = useRef<Map<string, number>>(new Map());
-  const connect = useCallback(async (cardText?: string) => {
-    const text = (cardText ?? card).trim();
-    if (!text) return;
-    setStatus("dialing host over relay…");
-    setStatusKind("busy");
-    setBusy(true);
-    try {
-      const conn = await roam.connect(text, "web");
-      // Key host state by the AUTHENTICATED endpoint id (QUIC-TLS-proven),
-      // not agentId() — that's a host-chosen display label and could collide.
-      const eid = conn.peerId();
-      const bytes = roamByteStreams(conn);
-      const stream = ndJsonStream(bytes.writable, bytes.readable);
-      const agent = new GooseClient(() => makeClient(), stream);
-      await agent.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      });
-      localStorage.setItem(HOST_CARD_KEY, text);
-      const prior = loadHosts().find((h) => h.endpointId === eid);
-      const name = hostName.trim() || prior?.name || `host ${eid.slice(0, 8)}`;
-      const entry: HostConn = { endpointId: eid, name, agent, conn, relay: relayRegion(text) };
-      hostsRef.current.set(eid, entry);
-      if (!activeHostRef.current) {
-        activeHostRef.current = eid;
-        setActiveHostId(eid);
-      }
-      // Per-host drop watch: reconnect this host with backoff. Other hosts'
-      // connections are untouched; if the open session lived here, resume it
-      // once the redial lands.
-      void agent.closed.then(() => {
-        if (hostsRef.current.get(eid)?.agent !== agent) return;
-        hostsRef.current.delete(eid);
-        if (activeHostRef.current === eid) {
-          resumeAfterDrop.current = sessionRef.current;
-          sessionRef.current = null;
+  const connect = useCallback(
+    async (targetText?: string, gatewayAuth?: GatewayAuth) => {
+      const text = (targetText ?? card).trim();
+      if (!text) return;
+      const roaming = isRoamCard(text);
+      setStatus(roaming ? "dialing host over relay…" : "connecting to gateway…");
+      setStatusKind("busy");
+      setBusy(true);
+      try {
+        // Gateway-only boot: the iroh wasm chunk is not loaded yet. Pull it in
+        // on demand the first time a real roam card shows up.
+        let rc = roam;
+        if (roaming && rc.kind !== "roam") {
+          if (!loadRoam) throw new Error("this build has no roam transport (gateway only)");
+          rc = await loadRoam();
+          setRoam(rc);
         }
-        if (hostsRef.current.size === 0) setConnected(false);
-        setBusy(false);
-        setSessions((xs) => xs.filter((s) => s._host !== eid));
-        const attempt = reconnectAttempts.current.get(eid) ?? 0;
-        reconnectAttempts.current.set(eid, attempt + 1);
-        if (attempt < 8) {
-          const delay = Math.min(20000, 1500 * 2 ** attempt);
-          if (hostsRef.current.size === 0) setReconnecting(true);
-          setStatus(`${name}: connection lost — reconnecting…`);
-          setStatusKind("err");
-          setTimeout(() => void connect(text), delay);
+        // Key target state by the AUTHENTICATED endpoint id (QUIC-TLS-proven
+        // for roam, a stable per-URL hash for a gateway), not agentId() — that's
+        // a chosen display label and could collide.
+        let agent: GooseClient;
+        let eid: string;
+        let conn: RoamConnection | null = null;
+        let auth: GatewayAuth | undefined;
+        let stored = text;
+        if (roaming) {
+          conn = await rc.connect(text, "web");
+          eid = conn.peerId();
+          const bytes = roamByteStreams(conn);
+          const stream = ndJsonStream(bytes.writable, bytes.readable);
+          agent = new GooseClient(() => makeClient(), stream);
         } else {
-          setReconnecting(false);
-          setStatus(`${name}: connection lost — press connect`);
-          setStatusKind("err");
+          const url = normalizeGatewayUrl(text);
+          eid = gatewayEndpointId(url);
+          stored = url;
+          // Fall back to whatever auth was saved with this gateway, so a
+          // reconnect after reload keeps working.
+          auth =
+            gatewayAuth ??
+            loadHosts().find((h) => h.endpointId === eid)?.gateway ?? { mode: "static" };
+          registerAcpGatewayAuth(gatewayBaseUrl(url), auth);
+          agent = new GooseClient(() => makeClient(), url);
         }
-      });
-      reconnectAttempts.current.delete(eid);
-      setRelay(entry.relay);
-      {
-        const next = loadHosts().filter((h) => h.endpointId !== eid);
-        next.unshift({ name, card: text, endpointId: eid });
-        localStorage.setItem(HOSTS_KEY, JSON.stringify(next.slice(0, 12)));
-        setHosts(next.slice(0, 12));
-        setHostName("");
-        setAddingHost(false);
-        setShowHosts(false);
-      }
-      setAgentId(eid);
-      setConnected(true);
-      setReconnecting(false);
-      setStatus("connected");
-      setStatusKind("ok");
-      await refreshSessions();
-      void refreshProjects();
-      const resume = resumeAfterDrop.current;
-      resumeAfterDrop.current = null;
-      if (resume && activeHostRef.current === eid) {
-        // recovering from a dropped connection mid-conversation: go back to it
-        await openSession(eid, resume, true);
-        inputRef.current?.focus();
-      }
-      // otherwise land on the session matrix (front page)
-      setBusy(false);
-    } catch (err) {
-      console.error(err);
-      setBusy(false);
-      const eid = cardEndpointHint(text);
-      const attempt = eid ? (reconnectAttempts.current.get(eid) ?? 0) : 0;
-      if (eid && attempt > 0 && attempt < 8) {
-        const delay = Math.min(20000, 1500 * 2 ** attempt);
-        reconnectAttempts.current.set(eid, attempt + 1);
-        setStatus("reconnecting…");
-        setStatusKind("err");
-        setTimeout(() => void connect(text), delay);
-      } else {
-        // Out of retries (or a first-time connect failed): fall back to the
-        // hosts page so the user can act.
+        await agent.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        });
+        localStorage.setItem(HOST_CARD_KEY, stored);
+        const prior = loadHosts().find((h) => h.endpointId === eid);
+        const name =
+          hostName.trim() ||
+          prior?.name ||
+          (roaming ? `host ${eid.slice(0, 8)}` : `gateway ${gatewayLabel(text)}`);
+        const entry: HostConn = {
+          endpointId: eid,
+          name,
+          agent,
+          conn,
+          relay: roaming ? relayRegion(text) : null,
+          gateway: auth,
+        };
+        hostsRef.current.set(eid, entry);
+        if (!activeHostRef.current) {
+          activeHostRef.current = eid;
+          setActiveHostId(eid);
+        }
+        // Per-target drop watch: reconnect it with backoff. Other targets'
+        // connections are untouched; if the open session lived here, resume it
+        // once the redial lands.
+        void agent.closed.then(() => {
+          if (hostsRef.current.get(eid)?.agent !== agent) return;
+          hostsRef.current.delete(eid);
+          if (activeHostRef.current === eid) {
+            resumeAfterDrop.current = sessionRef.current;
+            sessionRef.current = null;
+          }
+          if (hostsRef.current.size === 0) setConnected(false);
+          setBusy(false);
+          setSessions((xs) => xs.filter((s) => s._host !== eid));
+          const attempt = reconnectAttempts.current.get(eid) ?? 0;
+          reconnectAttempts.current.set(eid, attempt + 1);
+          if (attempt < 8) {
+            const delay = Math.min(20000, 1500 * 2 ** attempt);
+            if (hostsRef.current.size === 0) setReconnecting(true);
+            setStatus(`${name}: connection lost — reconnecting…`);
+            setStatusKind("err");
+            setTimeout(() => void connect(stored, auth), delay);
+          } else {
+            setReconnecting(false);
+            setStatus(`${name}: connection lost — press connect`);
+            setStatusKind("err");
+          }
+        });
+        reconnectAttempts.current.delete(eid);
+        setRelay(entry.relay);
+        {
+          const next = loadHosts().filter((h) => h.endpointId !== eid);
+          next.unshift({ name, card: stored, endpointId: eid, gateway: auth });
+          localStorage.setItem(HOSTS_KEY, JSON.stringify(next.slice(0, 12)));
+          setHosts(next.slice(0, 12));
+          setHostName("");
+          setAddingHost(false);
+          setShowHosts(false);
+        }
+        setAgentId(eid);
+        setConnected(true);
         setReconnecting(false);
-        setStatus(`connect failed: ${err}`);
-        setStatusKind("err");
-        // Not paired yet (fresh QR scan): open the pairing card — the user's
-        // next step is sending their own card to the host.
-        if (String(err).includes("not_allowlisted")) {
-          setAddingHost(true);
-          setPairOpen(true);
+        setStatus("connected");
+        setStatusKind("ok");
+        await refreshSessions();
+        void refreshProjects();
+        const resume = resumeAfterDrop.current;
+        resumeAfterDrop.current = null;
+        if (resume && activeHostRef.current === eid) {
+          // recovering from a dropped connection mid-conversation: go back to it
+          await openSession(eid, resume, true);
+          inputRef.current?.focus();
+        }
+        // otherwise land on the session matrix (front page)
+        setBusy(false);
+      } catch (err) {
+        console.error(err);
+        setBusy(false);
+        const eid = targetEndpointHint(text);
+        const attempt = eid ? (reconnectAttempts.current.get(eid) ?? 0) : 0;
+        if (eid && attempt > 0 && attempt < 8) {
+          const delay = Math.min(20000, 1500 * 2 ** attempt);
+          reconnectAttempts.current.set(eid, attempt + 1);
+          setStatus("reconnecting…");
+          setStatusKind("err");
+          setTimeout(() => void connect(text, gatewayAuth), delay);
+        } else {
+          // Out of retries (or a first-time connect failed): fall back to the
+          // hosts page so the user can act.
+          setReconnecting(false);
+          setStatus(`connect failed: ${roaming ? String(err) : connectErrorText(err)}`);
+          setStatusKind("err");
+          if (roaming) {
+            // Not paired yet (fresh QR scan): open the pairing card — the user's
+            // next step is sending their own card to the host.
+            if (String(err).includes("not_allowlisted")) {
+              setAddingHost(true);
+              setPairOpen(true);
+            }
+          } else {
+            // Gateway dial failed: show the gateway form with the URL that
+            // failed, so tenant/token/CORS mistakes can be fixed inline.
+            setGateway({ url: text });
+            setAddMode("gateway");
+            setAddingHost(true);
+          }
         }
       }
-    }
-  }, [card, hostName, roam, makeClient, refreshSessions, refreshProjects, openSession]);
+    },
+    [card, hostName, roam, loadRoam, makeClient, refreshSessions, refreshProjects, openSession, setGateway],
+  );
+
+  // Submit for the gateway form: a blank URL means same origin (the dev vite
+  // proxy or a production reverse proxy both forward /acp), and the auth the
+  // user typed rides the connect instead of being read from the form there.
+  const connectGateway = useCallback(async () => {
+    await connect(gateway.url.trim() || "/", gatewayAuthFromForm(gateway));
+  }, [connect, gateway]);
 
   // A send during an active run is a steer: the message is queued into the
   // running loop rather than starting a second one. Two ways to know a run is
@@ -847,7 +995,7 @@ export function App({ roam }: { roam: RoamClient }) {
       const m = modelFromConfigOptions(opts);
       if (m) setModelName(m);
     } catch (err) {
-      push({ kind: "system", text: `could not set ${configId}: ${err}` } as Omit<Item, "id">);
+      push({ kind: "system", text: `could not set ${configId}: ${errorText(err)}` } as Omit<Item, "id">);
     }
   }, [activeAgent, push]);
 
@@ -879,7 +1027,7 @@ export function App({ roam }: { roam: RoamClient }) {
         await steer(sid, text, runId);
         // pickup echoes back as a user_message_chunk; no local append needed
       } catch (err) {
-        push({ kind: "system", text: `steer failed: ${err}` } as Omit<Item, "id">);
+        push({ kind: "system", text: `steer failed: ${errorText(err)}` } as Omit<Item, "id">);
       }
       inputRef.current?.focus();
       return;
@@ -909,10 +1057,10 @@ export function App({ roam }: { roam: RoamClient }) {
           await steer(sid, text, bounce[1]);
           push({ kind: "system", text: "queued into the running turn" } as Omit<Item, "id">);
         } catch (err2) {
-          push({ kind: "system", text: `steer failed: ${err2}` } as Omit<Item, "id">);
+          push({ kind: "system", text: `steer failed: ${errorText(err2)}` } as Omit<Item, "id">);
         }
       } else {
-        push({ kind: "system", text: `error: ${err}` } as Omit<Item, "id">);
+        push({ kind: "system", text: `error: ${errorText(err)}` } as Omit<Item, "id">);
       }
     } finally {
       activeRunRef.current = null;
@@ -1036,6 +1184,13 @@ export function App({ roam }: { roam: RoamClient }) {
           setHostName={setHostName}
           setPairOpen={setPairOpen}
           connect={connect}
+          addMode={addMode}
+          setAddMode={setAddMode}
+          gateway={gateway}
+          setGateway={setGateway}
+          connectGateway={connectGateway}
+          p2pLoaded={roam.kind === "roam"}
+          enableP2P={loadRoam}
           startScan={startScan}
           stopScan={() => scanStop.current?.()}
           videoRef={videoRef}
@@ -1193,7 +1348,7 @@ export function App({ roam }: { roam: RoamClient }) {
                           onChange={(e) => void setConfigOption(o.id, e.target.value)}
                         >
                           {flatSelectOptions(o).map((v) => (
-                            <option key={v.id} value={v.id}>
+                            <option key={v.value} value={v.value}>
                               {v.name}
                             </option>
                           ))}

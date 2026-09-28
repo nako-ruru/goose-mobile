@@ -8,7 +8,11 @@ export {
   type GooseExtNotifications,
 } from "./generated/client.gen.js";
 export { GooseClient } from "./goose-client.js";
-export { createHttpStream } from "./http-stream.js";
+export {
+  createHttpStream,
+  registerAcpGatewayAuth,
+  type AcpGatewayAuth,
+} from "./http-stream.js";
 
 export {
   ClientSideConnection,
