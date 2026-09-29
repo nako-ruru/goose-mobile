@@ -28,6 +28,7 @@ import {
   wrapRoamClient,
   type RoamLike,
 } from "./gateway";
+import { completeLogin } from "./sso";
 
 const SECRET_STORAGE_KEY = "goose-roam-secret-hex";
 
@@ -82,6 +83,21 @@ async function boot() {
       document.documentElement.classList.toggle("dark", t === "dark");
     });
 
+  // Logto sends the browser back to <origin>/callback. Finish the code
+  // exchange — and the org-scoped refresh that makes the gateway accept the
+  // token (see sso.ts) — *before* the first render, so the app boots with the
+  // token in the gateway form instead of racing it against a remembered host's
+  // auto-connect. /callback itself is an SPA route: the server falls back to
+  // index.html for it.
+  let ssoError: string | null = null;
+  if (/^\/callback\/?$/.test(location.pathname)) {
+    try {
+      await completeLogin();
+    } catch (err) {
+      ssoError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   const gatewayOnlyBoot =
     gatewayOnlyBuild ||
     wantsGatewayBoot() ||
@@ -91,7 +107,11 @@ async function boot() {
   createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
       <IntlProvider locale="en" defaultLocale="en" messages={{}}>
-        <App roam={roam} loadRoam={gatewayOnlyBuild ? null : loadRoam} />
+        <App
+          roam={roam}
+          loadRoam={gatewayOnlyBuild ? null : loadRoam}
+          bootNotice={ssoError}
+        />
       </IntlProvider>
     </React.StrictMode>,
   );

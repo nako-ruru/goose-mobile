@@ -61,6 +61,10 @@ export default defineConfig({
         configure: (proxy) => {
           proxy.on("proxyRes", (proxyRes, _req, res) => {
             if (res.headersSent || res.writableEnded || res.destroyed) return;
+            // Dead upstream or a client that hung up mid-stream must not raise
+            // an unhandled error inside the manual pipe below.
+            proxyRes.on("error", () => res.destroy());
+            res.on("error", () => proxyRes.destroy());
             const headers: Record<string, string> = { ...proxyRes.headers };
             delete headers["transfer-encoding"];
             delete headers.connection;
@@ -81,6 +85,13 @@ export default defineConfig({
   build: {
     target: "esnext",
     outDir: "dist",
+  },
+  // Production serves the built app through a reverse proxy (Caddy) that keeps
+  // the public Host header. Vite's preview blocks unknown Host values, so the
+  // production name has to be allow-listed here or every request 403s with
+  // "This host is not allowed" before a byte of the app is served.
+  preview: {
+    allowedHosts: ["agent.guanghe.co"],
   },
   assetsInclude: ["**/*.wasm"],
 });

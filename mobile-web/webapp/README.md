@@ -132,6 +132,34 @@ same-origin:
 - a cross-origin static host (GitHub Pages form) needs a gateway CORS
   preflight — out of scope here.
 
+### Logto sign-in (jwt mode)
+
+`jwt` auth needs an `Authorization: Bearer` JWT the gateway's verification
+accepts. A browser app cannot get one straight from Logto: the
+`authorization_code` exchange returns an **opaque** token (no payload), and the
+tenant will not issue a resource-scoped JWT for a non-M2M application. So the
+app logs in with PKCE and then swaps its Logto tokens for a gateway ticket at a
+**same-origin `/token` endpoint** (no CORS, no secret in the browser — the
+password is typed on Logto's page, we only send `client_id`):
+
+```
+POST <origin>/token   {"access_token": <opaque>, "id_token": <id_token>}
+  200 {access_token, expires_in, subject, organization_id}
+  400 missing_access_token    401 invalid_session | id_token_mismatch
+  403 not_allowed | not_in_org    429 rate_limited
+```
+
+The broker validates the session server-side (Logto `/oidc/me`) and mints the
+gateway JWT, so a ticket can be tied to the person who logged in. Gateway
+tickets are short-lived, so the app mints a fresh one before a connect when the
+stored one is about to expire and again before a `jwt` reconnect; the error
+codes above map to UI copy without echoing any token material.
+
+Hosting notes: `/token` must be reachable same-origin (the reverse proxy in
+front of the static build owns it, like `/acp`), and `vite preview` needs
+`preview.allowedHosts` to include the public name or every request 403s with
+"This host is not allowed" before a byte of the app is served.
+
 ### Gateway-only builds
 
 `VITE_GATEWAY_ONLY=1 pnpm build` ships no iroh wasm chunk at all (verified:
@@ -206,7 +234,8 @@ boot with no wasm request, `initialize` carrying `X-Tenant-Id`/`X-User-Id`
 anywhere, `session/list` rendered, no console errors or auth material. With
 the southbound goose running it takes the success path: `session/new` opens a
 session and a prompt must come back `PONG`. If goose never came up (the
-gateway was launched without `-south-secret` / `-goose-config`), `session/new`
+gateway was launched without `-south-secret`, so the sandboxed goose has no
+`GOOSE_SERVER__SECRET_KEY` and exits immediately), `session/new`
 answers `-32002`, and the run asserts the user sees the mapped copy with the
 trace id (`服务暂不可用（trace: …）`) — never a raw JSON-RPC blob. Every frame is
 traced (`ACP_DEBUG`) and the `/acp` traffic plus a gateway-side subscriber

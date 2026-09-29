@@ -16,9 +16,10 @@
 //      what the user sees (-32002 → 服务暂不可用 + trace id), never a raw blob
 //
 // session/new/prompt outcomes are reported either way: a gateway whose
-// southbound goose could not start (it was launched without -south-secret /
-// -goose-config, so the sandboxed goose dies) answers -32002 here, which is
-// the server's state, not this client's.
+// southbound goose could not start (launched without -south-secret, so the
+// sandboxed goose has no GOOSE_SERVER__SECRET_KEY and dies on boot — the true
+// cause of -32002 here) answers -32002, which is the server's state, not this
+// client's.
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { chromium } from "playwright";
@@ -258,7 +259,8 @@ try {
     }
   } else {
     // Server state, not client: -32002 means the southbound goose never came
-    // up (gateway started without -south-secret / -goose-config).
+    // up — the gateway was started without -south-secret, so goose has no
+    // GOOSE_SERVER__SECRET_KEY and exits immediately.
     const hasMappedCopy = /服务暂不可用/.test(logText);
     const hasTrace = /trace/.test(logText);
     check(
@@ -266,7 +268,7 @@ try {
       `session/new refused → UI shows mapped copy + trace id (${logText.trim().slice(0, 160).replace(/\s+/g, " ")})`,
     );
     notes.push(
-      `session/new blocked server-side (${outcome}) — southbound goose not running; check the gateway's -south-secret / -goose-config`,
+      `session/new blocked server-side (${outcome}) — southbound goose not running; gateway missing -south-secret (no GOOSE_SERVER__SECRET_KEY → goose exits at boot)`,
     );
   }
 

@@ -35,6 +35,10 @@ type ConnectPanelProps = {
   gateway: GatewayForm;
   setGateway: (patch: Partial<GatewayForm>) => void;
   connectGateway: () => Promise<void>;
+  /** Kick off the Logto SSO round trip (this tab leaves for the IdP). */
+  ssoLogin: () => void;
+  /** A token is sitting in the form (logged in or pasted) — connect can use it. */
+  ssoReady: boolean;
   /** The iroh transport is loaded (or can be loaded on demand). */
   p2pLoaded: boolean;
   enableP2P: (() => Promise<RoamLike>) | null;
@@ -74,6 +78,8 @@ export function ConnectPanel({
   gateway,
   setGateway,
   connectGateway,
+  ssoLogin,
+  ssoReady,
   p2pLoaded,
   enableP2P,
 }: ConnectPanelProps) {
@@ -274,15 +280,35 @@ export function ConnectPanel({
                         />
                       </div>
                     ) : (
-                      <input
-                        id="gateway-token"
-                        type="password"
-                        autoComplete="off"
-                        className="w-full bg-background-secondary rounded-lg px-3 py-2 text-sm font-mono mb-2"
-                        placeholder="jwt"
-                        value={gateway.token}
-                        onChange={(e) => setGateway({ token: e.target.value })}
-                      />
+                      <>
+                        <input
+                          id="gateway-token"
+                          type="password"
+                          autoComplete="off"
+                          className="w-full bg-background-secondary rounded-lg px-3 py-2 text-sm font-mono mb-2"
+                          placeholder="jwt"
+                          value={gateway.token}
+                          onChange={(e) => setGateway({ token: e.target.value })}
+                        />
+                        <div className="flex items-center gap-2 mb-2">
+                          <button
+                            id="sso-login"
+                            type="button"
+                            onClick={ssoLogin}
+                            className="text-text-secondary rounded-lg px-3 py-1.5 text-xs hover:bg-background-secondary hover:text-text-primary transition-colors"
+                          >
+                            sign in with Logto
+                          </button>
+                          {ssoReady && (
+                            <span
+                              id="sso-ready"
+                              className="text-[10px] text-text-tertiary"
+                            >
+                              token ready — connect
+                            </span>
+                          )}
+                        </div>
+                      </>
                     )}
                     <div className="mt-2.5 flex items-center gap-2">
                       <span className="flex-1" />

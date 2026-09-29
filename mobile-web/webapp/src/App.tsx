@@ -52,6 +52,7 @@ import {
   type GatewayForm,
   type RoamLike,
 } from "./gateway";
+import { beginLogin, renewTicket, savedToken, ticketStale } from "./sso";
 import { groupSessions, type TaggedSession } from "./sessions";
 import { ConnectPanel } from "./ConnectPanel";
 
@@ -204,10 +205,13 @@ let nextId = 1;
 export function App({
   roam: initialRoam,
   loadRoam,
+  bootNotice,
 }: {
   roam: RoamLike;
   /** Loads the iroh wasm transport on demand; null in gateway-only builds. */
   loadRoam: (() => Promise<RoamLike>) | null;
+  /** A failed Logto round trip, resolved in main.tsx before the first render. */
+  bootNotice?: string | null;
 }) {
   // Which transport is loaded: a gateway-only boot starts with a stub (no
   // wasm, no iroh) and swaps in the real one the first time a roam card is
@@ -403,6 +407,21 @@ export function App({
       // the "first time? pair this browser" card) is already on screen.
       void connect(linked);
       return;
+    }
+    // A Logto round trip that failed on /callback: main.tsx resolved it before
+    // rendering, so the copy lands here (mapped rules still apply — no token,
+    // no raw response body beyond what the message already says).
+    if (bootNotice) {
+      setStatus(bootNotice);
+      setStatusKind("err");
+    }
+    // A gateway-ready access_token from an earlier Logto login: prefill the
+    // gateway form, so all that is left is "connect" (blank URL = same origin
+    // = the reverse proxy that fronts the gateway).
+    const sso = savedToken();
+    if (sso) {
+      setAddMode("gateway");
+      setGateway({ mode: "jwt", token: sso });
     }
     const saved = localStorage.getItem(HOST_CARD_KEY);
     if (!saved) return;
@@ -894,7 +913,19 @@ export function App({
             if (hostsRef.current.size === 0) setReconnecting(true);
             setStatus(`${name}: connection lost — reconnecting…`);
             setStatusKind("err");
-            setTimeout(() => void connect(stored, auth), delay);
+            setTimeout(() => {
+              void (async () => {
+                // A redial after a long drop can outlive the gateway ticket;
+                // mint a fresh one when there is still a Logto session, and
+                // otherwise redial exactly as we were.
+                let next = auth;
+                if (auth?.mode === "jwt") {
+                  const fresh = await renewTicket().catch(() => null);
+                  if (fresh) next = { mode: "jwt", token: fresh };
+                }
+                await connect(stored, next);
+              })();
+            }, delay);
           } else {
             setReconnecting(false);
             setStatus(`${name}: connection lost — press connect`);
@@ -969,8 +1000,51 @@ export function App({
   // proxy or a production reverse proxy both forward /acp), and the auth the
   // user typed rides the connect instead of being read from the form there.
   const connectGateway = useCallback(async () => {
-    await connect(gateway.url.trim() || "/", gatewayAuthFromForm(gateway));
-  }, [connect, gateway]);
+    // A jwt mode with an empty token would dial out with `Authorization:
+    // Bearer ` and get a 401 back; say so here instead.
+    if (gateway.mode === "jwt" && !gateway.token.trim() && !savedToken()) {
+      setStatus("jwt 模式需要 token —— 点 sign in with Logto，或直接粘贴一个");
+      setStatusKind("err");
+      setAddingHost(true);
+      setAddMode("gateway");
+      return;
+    }
+    // A gateway ticket is short-lived: swap the stored Logto tokens for a fresh
+    // one instead of dialling with a ticket that is about to (or already)
+    // expire. renewTicket() returns null when there is no Logto session — a
+    // hand-pasted ticket then rides through untouched.
+    let token = gateway.token.trim();
+    if (gateway.mode === "jwt" && (ticketStale() || !token)) {
+      try {
+        const fresh = await renewTicket();
+        if (fresh) {
+          token = fresh;
+          setGateway({ token: fresh });
+        }
+      } catch (err) {
+        setStatus(`换票失败：${errorText(err)}`);
+        setStatusKind("err");
+        if (!token) return;
+      }
+    }
+    await connect(gateway.url.trim() || "/", gatewayAuthFromForm({ ...gateway, token }));
+  }, [connect, gateway, setGateway]);
+
+  // Logto round trip: the tab leaves for auth.logto.guanghe.co and comes back
+  // to /callback, where main.tsx finishes the code exchange and swaps the
+  // Logto tokens for a gateway ticket before this app boots again. All this can
+  // report is a failure to even start the redirect.
+  const loginWithLogto = useCallback(async () => {
+    try {
+      await beginLogin();
+    } catch (err) {
+      setStatus(`login failed: ${errorText(err)}`);
+      setStatusKind("err");
+    }
+  }, []);
+
+  /** A usable token in the form, from a login or pasted by hand. */
+  const ssoReady = gateway.mode === "jwt" && gateway.token.trim().length > 0;
 
   // A send during an active run is a steer: the message is queued into the
   // running loop rather than starting a second one. Two ways to know a run is
@@ -1189,6 +1263,8 @@ export function App({
           gateway={gateway}
           setGateway={setGateway}
           connectGateway={connectGateway}
+          ssoLogin={() => void loginWithLogto()}
+          ssoReady={ssoReady}
           p2pLoaded={roam.kind === "roam"}
           enableP2P={loadRoam}
           startScan={startScan}
